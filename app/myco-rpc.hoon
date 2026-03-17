@@ -105,10 +105,54 @@
       ==
     ::
     %json
-      ::  Handle JSON pokes from Eyre for HTTP RPC interface
+      ::  Handle JSON-RPC 2.0 pokes from Eyre
+      ::
+      ::  Expected format:
+      ::  { "jsonrpc": "2.0",
+      ::    "method": "getBalance",
+      ::    "params": { "layer": "l1", "address": "~zod" },
+      ::    "id": 1 }
+      ::
       =/  jon=json  !<(json vase)
-      ::  TODO: Parse JSON-RPC format and dispatch
-      [~ this]
+      ?>  ?=(%o -.jon)
+      =/  method=(unit json)  (~(get by p.jon) 'method')
+      ?~  method  [~ this]
+      ?>  ?=(%s -.u.method)
+      =/  method-name=@t  p.u.method
+      =/  params=(unit json)  (~(get by p.jon) 'params')
+      =/  req-id=(unit json)  (~(get by p.jon) 'id')
+      ::  Parse layer from params (default to L1)
+      =/  loc=layer-location
+        ?~  params  [%l1 ~]
+        ?.  ?=(%o -.u.params)  [%l1 ~]
+        =/  layer-json=(unit json)  (~(get by p.u.params) 'layer')
+        ?~  layer-json  [%l1 ~]
+        ?.  ?=(%s -.u.layer-json)  [%l1 ~]
+        ?:  =(p.u.layer-json 'l1')  [%l1 ~]
+        ?:  =((end 3 2 p.u.layer-json) 'l2')
+          =/  gal-json=(unit json)  (~(get by p.u.params) 'galaxy')
+          ?~  gal-json  [%l1 ~]
+          ?.  ?=(%s -.u.gal-json)  [%l1 ~]
+          [%l2 (slav %p p.u.gal-json)]
+        ?:  =((end 3 2 p.u.layer-json) 'l3')
+          =/  star-json=(unit json)  (~(get by p.u.params) 'star')
+          ?~  star-json  [%l1 ~]
+          ?.  ?=(%s -.u.star-json)  [%l1 ~]
+          [%l3 (slav %p p.u.star-json)]
+        [%l1 ~]
+      ::  Parse address from params if present
+      =/  addr-param=*
+        ?~  params  ~
+        ?.  ?=(%o -.u.params)  ~
+        =/  addr-json=(unit json)  (~(get by p.u.params) 'address')
+        ?~  addr-json  ~
+        ?.  ?=(%s -.u.addr-json)  ~
+        (slav %p p.u.addr-json)
+      ::  Dispatch as RPC to %myco vane
+      =/  =note-arvo  [%m %rpc-request loc method-name addr-param]
+      :_  this(rpc-nonce.state +(rpc-nonce.state))
+      :~  [%pass /rpc/(scot %ud rpc-nonce.state) %arvo note-arvo]
+      ==
   ==
 ::
 ++  on-watch

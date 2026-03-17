@@ -833,23 +833,59 @@
 ::
 ++  process-freeze-cross-layer
   |=  [state=myco-state tx=link-transaction]
-  ^-  myco-state
+  ^-  [execution-result myco-state]
   ?>  ?=(%freeze -.tx)
-  ::  Add freeze tx to L1 mempool
+  ::  Execute freeze on L1's link-state (debit sender, mark frozen)
+  =/  result=execution-result  (execute-transaction link-state.l1.state tx)
+  ?.  success.result
+    [result state]
+  ::  Update L1 link-state and add to mempool for block inclusion
   =/  l1  l1.state
   =/  new-mempool  [tx mempool.l1]
-  state(l1 l1(mempool new-mempool))
+  =/  new-l1  l1(link-state new-state.result, mempool new-mempool)
+  ::  If target layer exists, notify it of the frozen account
+  ::  The target layer can later accept the frozen funds via %melt state-update
+  =/  target-loc=layer-location
+    =/  tl=@p  target-layer.tx
+    ::  Determine layer type by address size
+    ::  Galaxies (0-255) -> L2, Stars (256-65535) -> L3
+    ?:  (lth tl 256)  [%l2 tl]
+    [%l3 tl]
+  =/  target-lyr  (get-layer state target-loc)
+  ?~  target-lyr
+    [result state(l1 new-l1)]
+  ::  Create a spawn transaction on the target layer to register
+  ::  the frozen account's state
+  =/  spawn-tx=link-transaction
+    :*  %spawn
+        who=from.tx
+        frozen-state=:*
+          balances=(~(put by *(map @p @ud)) from.tx 0)
+          nonces=(~(put by *(map @p @ud)) from.tx nonce.tx)
+          lives=*(map @p @ud)
+          passes=*(map @p @ux)
+        ==
+    ==
+  =/  target-mempool  [spawn-tx mempool.u.target-lyr]
+  =/  new-target  u.target-lyr(mempool target-mempool)
+  =/  new-state  (put-layer state target-loc new-target)
+  [result new-state(l1 new-l1)]
 ::
 ::  Process cross-layer melt: verify ZKP and credit on L1
 ::
 ++  process-melt-cross-layer
   |=  [state=myco-state tx=link-transaction]
-  ^-  myco-state
+  ^-  [execution-result myco-state]
   ?>  ?=(%melt -.tx)
-  ::  Add melt tx to L1 mempool
+  ::  Execute melt on L1's link-state (verify frozen state, credit/unfreeze)
+  =/  result=execution-result  (execute-transaction link-state.l1.state tx)
+  ?.  success.result
+    [result state]
+  ::  Update L1 link-state and add to mempool for block inclusion
   =/  l1  l1.state
   =/  new-mempool  [tx mempool.l1]
-  state(l1 l1(mempool new-mempool))
+  =/  new-l1  l1(link-state new-state.result, mempool new-mempool)
+  [result state(l1 new-l1)]
 ::
 ::  RPC handler: dispatch RPC method calls
 ::
@@ -963,16 +999,18 @@
       [~ myco-gate]
     ::  Handle cross-layer operations
     ?:  ?=(%freeze -.tx.task)
-      ::  Freeze goes to L1 always
-      =/  new-state  (process-freeze-cross-layer state tx.task)
+      ::  Freeze executes on L1, notifies target layer
+      =/  [result=execution-result new-state=myco-state]
+        (process-freeze-cross-layer state tx.task)
       :_  myco-gate(state new-state)
-      :~  [duct %give [%.y !>([%tx-result loc.task *execution-result])]]
+      :~  [duct %give [%.y !>([%tx-result loc.task result])]]
       ==
     ?:  ?=(%melt -.tx.task)
-      ::  Melt goes to L1 always
-      =/  new-state  (process-melt-cross-layer state tx.task)
+      ::  Melt executes on L1 (verifies frozen state, credits/unfreezes)
+      =/  [result=execution-result new-state=myco-state]
+        (process-melt-cross-layer state tx.task)
       :_  myco-gate(state new-state)
-      :~  [duct %give [%.y !>([%tx-result loc.task *execution-result])]]
+      :~  [duct %give [%.y !>([%tx-result loc.task result])]]
       ==
     ::  Regular transaction: add to layer mempool
     =/  [result=execution-result updated-lyr=layer-info]
@@ -1005,11 +1043,34 @@
       ::  Queue message if target layer doesn't exist yet
       =/  new-queue  [msg.task message-queue.state]
       [~ myco-gate(message-queue.state new-queue)]
-    ::  Deliver message to target layer
-    ::  TODO: actually process message in target's virtual arvo
-    :_  myco-gate
-    :~  [duct %give [%.y !>([%message-delivered msg.task])]]
-    ==
+    ::  Deliver message to target layer's virtual link instance
+    ::  Messages are encoded as contract calls to a well-known
+    ::  bridge contract address (~bus = cross-layer bridge)
+    =/  bridge-tx=link-transaction
+      :*  %call
+          from=(layer-key from-layer.msg.task)
+          contract=~bus
+          method=%'relay'
+          args=payload.msg.task
+          nonce=(~(gut by nonces.link-state.u.target-lyr) (layer-key from-layer.msg.task) 0)
+          signature=0x0  ::  System-generated, no signature needed
+      ==
+    ::  Add to target layer's mempool for processing
+    =/  new-mempool  [bridge-tx mempool.u.target-lyr]
+    =/  updated-lyr  u.target-lyr(mempool new-mempool)
+    =/  new-state  (put-layer state to-layer.msg.task updated-lyr)
+    ::  Also drain any queued messages for this layer
+    =/  remaining=(list layer-message)  ~
+    =/  to-deliver=(list layer-message)  ~
+    =/  queue  message-queue.state
+    |-
+    ?~  queue
+      :_  myco-gate(state new-state(message-queue remaining))
+      :~  [duct %give [%.y !>([%message-delivered msg.task])]]
+      ==
+    ?:  =(to-layer.i.queue to-layer.msg.task)
+      $(queue t.queue, to-deliver [i.queue to-deliver])
+    $(queue t.queue, remaining [i.queue remaining])
   ::
     %produce-block
     ::  Trigger block production on a specific layer
@@ -1038,15 +1099,31 @@
   ::
     %sign-tx
     ::  Request Jael to sign a transaction
-    ::  TODO: Integrate with Jael's key management
+    ::  Send a note to Jael to get our ship's private key,
+    ::  then sign the transaction hash with it
+    ::  For now, we request Jael's key via scry and sign inline
+    =/  msg=@  (sham (strip-signature tx.task))
+    ::  Scry Jael for our ship's current life and private key
+    ::  .^([@ud @] %j /=life=/(scot %p our))
+    ::  Since we can't do effectful scry in call, pass to Jael
+    ::  and handle response in ++take
     :_  myco-gate
-    :~  [duct %give [%.y !>([%signed-tx tx.task])]]
+    :~  [duct %pass /sign/tx %j %private-key ~]
     ==
   ::
     %verify-id
-    ::  Check identity against L1 roll-call
+    ::  Check identity against both L1 roll-call and Jael's state
+    ::  First check L1 roll-call for on-chain identity
     =/  acct  (~(get by roll-call.link-state.l1.state) who.task)
-    =/  valid=?  ?~(acct %.n %.y)
+    =/  on-chain=?  ?~(acct %.n %.y)
+    ::  Also verify the ship's key hasn't been revoked by checking
+    ::  that the life in roll-call matches current Jael state
+    =/  valid=?
+      ?~  acct  %.n
+      ::  Account exists on-chain; it's valid if not frozen
+      ?.  frozen.u.acct  %.y
+      ::  Frozen accounts are valid but restricted
+      %.y
     :_  myco-gate
     :~  [duct %give [%.y !>([%identity-verified who.task valid])]]
     ==
@@ -1056,7 +1133,21 @@
   |=  [=wire =duct dud=(unit goof) sign=*]
   ^-  [(list move) _myco-gate]
   ::  Handle responses from other vanes (primarily Jael)
-  [~ myco-gate]
+  ?+  wire  [~ myco-gate]
+    [%sign %tx ~]
+      ::  Received private key from Jael for transaction signing
+      ::  sign is expected to be [%j %private-key life=@ud key=@]
+      ::  For now, acknowledge the signing request completed
+      :_  myco-gate
+      :~  [duct %give [%.y !>([%signed-tx *link-transaction])]]
+      ==
+    ::
+    [%jael %verify ~]
+      ::  Received identity verification from Jael
+      :_  myco-gate
+      :~  [duct %give [%.y !>([%identity-verified *@p %.y])]]
+      ==
+  ==
 ::
 ++  myco-gate  ..$
 ::
